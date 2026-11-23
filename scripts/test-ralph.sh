@@ -96,6 +96,18 @@ elif [ "$name" = "opencode" ]; then
       *) [ -z "$prompt" ] && prompt="$1"; shift ;;
     esac
   done
+elif [ "$name" = "agy" ]; then
+  [ -t 0 ] || cat > /dev/null
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -p|--print|--prompt) prompt="$2"; shift 2 ;;
+      --mode) [ "$2" = "plan" ] && verify=1; shift 2 ;;
+      --model) model="$2"; shift 2 ;;
+      --output-format) outfmt="$2"; shift 2 ;;
+      -*) shift ;;
+      *) shift ;;
+    esac
+  done
 else
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -186,6 +198,25 @@ case "$scenario" in
       exit 1
     fi
     ;;
+  agy-fail)
+    echo '{"event":"result","result":{"status":"ERROR","error":"fatal error in agy"}}'
+    exit 1
+    ;;
+  agy-fail-exit0)
+    echo '{"event":"result","result":{"status":"ERROR","error":"model execution failed"}}'
+    exit 0
+    ;;
+  agy-no-result)
+    echo '{"event":"step_update","step_update":{"state":"RUNNING"}}'
+    exit 0
+    ;;
+  agy-limit)
+    if [ "$n" -eq 1 ]; then
+      echo '{"event":"step_update","step_update":{"state":"ERROR","text_delta":"RESOURCE_EXHAUSTED: quota exceeded"}}'
+      echo '{"event":"result","result":{"status":"ERROR","error":"quota exceeded"}}'
+      exit 1
+    fi
+    ;;
 esac
 
 # stall-after-red: escreve no 1o ciclo (teste vermelho), depois trava sem
@@ -246,6 +277,19 @@ elif [ "$name" = "opencode" ]; then
   else
     echo "Done."
   fi
+elif [ "$name" = "agy" ]; then
+  if [ "$outfmt" = "stream-json" ]; then
+    n_tasks=$(grep -cE '^[[:space:]]*- \[[ x]\]' <<< "$prompt")
+    [ "$n_tasks" -eq 0 ] && n_tasks=1
+    echo '{"event":"init","conversation_id":"mock-agy","init":{"cwd":"/mock","tools":[]}}'
+    for i in $(seq 1 "$n_tasks"); do
+      echo '{"event":"step_update","step_update":{"state":"RUNNING"}}'
+      echo "{\"event\":\"step_update\",\"step_update\":{\"state\":\"DONE\",\"step_type\":\"agent_response\",\"text_delta\":\"RALPH-TASK $i START\nRALPH-TASK $i DONE\n\"}}"
+    done
+    echo '{"event":"result","result":{"status":"SUCCESS","response":"Done","duration_seconds":1,"num_turns":1}}'
+  else
+    echo "Done."
+  fi
 else
   echo "Done."
 fi
@@ -256,6 +300,7 @@ MOCK
   cp "$bin/mock-engine" "$bin/claude"
   cp "$bin/mock-engine" "$bin/codex"
   cp "$bin/mock-engine" "$bin/opencode"
+  cp "$bin/mock-engine" "$bin/agy"
 }
 
 make_testcmd() {
@@ -1459,6 +1504,73 @@ assert_eq "$rc" "0" "exit 0 (limite nao consome ciclo e retoma)"
 commits=$(git -C "$d/repo" rev-list --count HEAD)
 assert_eq "$commits" "3" "fases commitadas apos a espera"
 assert_contains "$d/out.log" "Limite de uso atingido" "limite detectado no output do opencode"
+
+# ---------------------------------------------------------------------------
+header "42. Antigravity (agy) — execucao completa com sucesso (caminho feliz)"
+# ---------------------------------------------------------------------------
+d=$(new_case agy-ok)
+rc=$(run_ralph "$d" ok --engine agy --test-cmd "$d/test.sh")
+
+assert_eq "$rc" "0" "exit 0"
+commits=$(git -C "$d/repo" rev-list --count HEAD)
+assert_eq "$commits" "3" "2 commits de fase (1 fixture + 2)"
+assert_contains "$d/repo/.phases/.progress" "phase-01.md" "progresso registra phase-01"
+assert_contains "$d/repo/.phases/.progress" "phase-02.md" "progresso registra phase-02"
+assert_eq "$(cat "$d/state/impl_calls")" "2" "1 sessao de implementacao por fase (2 fases)"
+assert_eq "$(cat "$d/state/verify_calls")" "2" "gate 3 rodou em toda fase com agy"
+
+# ---------------------------------------------------------------------------
+header "43. Antigravity (agy) — falha de execucao reprova no Gate 0"
+# ---------------------------------------------------------------------------
+d=$(new_case agy-gate0-fail)
+rc=$(run_ralph "$d" agy-fail --engine agy --test-cmd "$d/test.sh" --max-cycles 1)
+
+assert_eq "$rc" "1" "exit 1 (reprovado pelo gate 0)"
+commits=$(git -C "$d/repo" rev-list --count HEAD)
+assert_eq "$commits" "1" "nenhum commit criado"
+assert_contains "$d/out.log" "Gate 0 vermelho" "gate 0 reportado vermelho no log"
+
+# ---------------------------------------------------------------------------
+header "44. Antigravity (agy) — exit 0 com status ERROR reprova no Gate 0"
+# ---------------------------------------------------------------------------
+d=$(new_case agy-gate0-fail-exit0)
+rc=$(run_ralph "$d" agy-fail-exit0 --engine agy --test-cmd "$d/test.sh" --max-cycles 1)
+
+assert_eq "$rc" "1" "exit 1 (status ERROR com exit 0 reprovado)"
+commits=$(git -C "$d/repo" rev-list --count HEAD)
+assert_eq "$commits" "1" "nenhum commit criado"
+assert_contains "$d/out.log" "Gate 0 vermelho" "gate 0 reportado vermelho no log"
+
+# ---------------------------------------------------------------------------
+header "45. Antigravity (agy) — encerramento sem evento result reprova no Gate 0"
+# ---------------------------------------------------------------------------
+d=$(new_case agy-gate0-no-result)
+rc=$(run_ralph "$d" agy-no-result --engine agy --test-cmd "$d/test.sh" --max-cycles 1)
+
+assert_eq "$rc" "1" "exit 1 (sem evento result reprovado)"
+commits=$(git -C "$d/repo" rev-list --count HEAD)
+assert_eq "$commits" "1" "nenhum commit criado"
+assert_contains "$d/out.log" "Gate 0 vermelho" "gate 0 reportado vermelho no log"
+
+# ---------------------------------------------------------------------------
+header "46. Antigravity (agy) — verificador independente respeita --verify-model"
+# ---------------------------------------------------------------------------
+d=$(new_case agy-verify-model)
+rc=$(run_ralph "$d" ok --engine agy --verify-model "gemini-3.8-flash-low" --test-cmd "$d/test.sh")
+
+assert_eq "$rc" "0" "exit 0"
+assert_eq "$(cat "$d/state/verify_model")" "gemini-3.8-flash-low" "--verify-model repassado ao agy"
+
+# ---------------------------------------------------------------------------
+header "47. Antigravity (agy) — limite de taxa retoma execucao"
+# ---------------------------------------------------------------------------
+d=$(new_case agy-limit)
+rc=$(run_ralph "$d" agy-limit --engine agy --test-cmd "$d/test.sh" --max-cycles 1)
+
+assert_eq "$rc" "0" "exit 0 (limite nao consome ciclo e retoma)"
+commits=$(git -C "$d/repo" rev-list --count HEAD)
+assert_eq "$commits" "3" "fases commitadas apos a espera"
+assert_contains "$d/out.log" "Limite de uso atingido" "limite detectado no output do agy"
 
 # ---------------------------------------------------------------------------
 echo ""
