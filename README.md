@@ -4,10 +4,11 @@
 
 A developer harness with commands, agents, and scripts that take a project from idea to implementation in a structured way: formal specification, phased planning, and autonomous execution with mechanical validation — while keeping a human in control at every decision point.
 
-Supports three engines:
+Supports four engines:
 - **Codex** (default in Ralph)
 - **Claude Code**
 - **OpenCode**
+- **Antigravity** (`agy`)
 
 The harness is **stack-agnostic**: language, framework, commands, and conventions are defined by the project's own documents (`AGENTS.md`, `CLAUDE.md`, the `.spec/` chain), never by the harness.
 
@@ -62,6 +63,7 @@ This repository provides native OpenCode configuration (`opencode.json` and `.op
 - Codex engine: `npm install -g @openai/codex` + `OPENAI_API_KEY`
 - Claude engine: `npm install -g @anthropic-ai/claude-code` + `ANTHROPIC_API_KEY`
 - OpenCode engine: `curl -fsSL https://opencode.ai/install | bash` + configured provider/model
+- Antigravity engine: Google Antigravity CLI (`agy`) installed and authenticated (headless execution, no IDE GUI required)
 - Root of a git repository with a **clean** working tree
 
 ## Commands
@@ -168,7 +170,7 @@ With no argument, the input resolves in this order: `.spec/init/project-phases.m
 
 | Gate | Question | How it decides |
 |---|---|---|
-| 0 | Did the engine actually finish? | claude: `is_error` in the result JSON; codex / opencode: exit code |
+| 0 | Did the engine actually finish? | claude: `is_error` in result JSON; agy: `status == SUCCESS` in result event; codex / opencode: exit code |
 | 1 | Did the session write code? | Tree signature before/after. **A signal, not a verdict** — an already-implemented phase makes the engine (correctly) write nothing; the signal feeds the fix-cycle cause |
 | 2 | Does the test suite pass? | Run **by ralph itself**, outside the agent session — the agent cannot "fake green" |
 | 3 | Is each task actually in the code? | Independent read-only verifier session that emits `TASK <n>: DONE/INCOMPLETE` per task. Runs on every phase by default (`RALPH_VERIFY=always`); supports `--verify-model` (claude default: `sonnet`) |
@@ -187,7 +189,7 @@ Laravel Sail projects: the suite runs **inside the container** (`vendor/bin/sail
 
 | Option | Effect |
 |---|---|
-| `--engine codex\|claude\|opencode` | Implementation engine (default: `codex`) |
+| `--engine codex\|claude\|opencode\|agy` | Implementation engine (default: `codex`) |
 | `--from N` | Starts at phase N (clears progress for phases ≥ N) |
 | `--keep-going` | Continues after a phase fails (creates a `wip(phase-N)` commit; default: stop) |
 | `--max-cycles N` | Fix cycles per phase (default: 3) |
@@ -237,14 +239,15 @@ ralph publishes run state to `.phases/state/` **always**, with or without `--das
 
 ### Where per-task progress comes from
 
-A phase is **one** agent session, so ralph could not know where the session is — unless the session says so. On the **claude** and **opencode** engines it does:
+A phase is **one** agent session, so ralph could not know where the session is — unless the session says so. On the **claude**, **opencode**, and **agy** engines it does:
 
 - **Claude**: runs with `--output-format stream-json`
 - **OpenCode**: runs with `--format json`
+- **Antigravity**: runs with `--output-format stream-json` (headless via `agy`)
 
-Both engines emit events line by line **while** they work. ralph reads that stream and rewrites progress into `.phases/state/live.tsv`, from four sources, in this order of precedence:
+All three engines emit events line by line **while** they work. ralph reads that stream and rewrites progress into `.phases/state/live.tsv`, from four sources, in this order of precedence:
 
-1. **Text markers** (primary source). The prompt tells the agent to write, as a standalone line, `RALPH-TASK <n> START` before starting item *n* and `RALPH-TASK <n> DONE` once it is ready. It is plain text: it **depends on no tool at all** — which is what matters, because in a headless session (`claude -p` or `opencode run`) task-list tools simply do not exist, even when the agent tries to load them via `ToolSearch`.
+1. **Text markers** (primary source). The prompt tells the agent to write, as a standalone line, `RALPH-TASK <n> START` before starting item *n* and `RALPH-TASK <n> DONE` once it is ready. It is plain text: it **depends on no tool at all** — which is what matters, because in a headless session (`claude -p`, `opencode run`, or `agy -p`) task-list tools simply do not exist, even when the agent tries to load them via `ToolSearch`.
 2. **The agent's task list**, when the session has one (`TaskCreate`/`TaskUpdate` or `TodoWrite`): its `in_progress`/`completed` transitions become progress.
 3. **Observational fallback** — with no marker and no list, ralph infers from what the agent edits. A `/plan` plan declares `Arquivos:` on every item, and it is that match (edited path ↔ file declared by the task) that provides the granularity; without the declaration it falls back to the task's own text. On entering a task the earlier ones count as done — the agent works in order, and not every task has a file of its own.
 4. **Sign of life**: as soon as the session opens, task 1 shows as running — never a whole phase frozen at "Pendente".
@@ -338,7 +341,7 @@ docs/plans/                    internal hardening plans for the harness
 ## Development
 
 ```bash
-scripts/test-ralph.sh        # ralph.sh suite — fake `claude`/`codex`/`opencode` binaries
+scripts/test-ralph.sh        # ralph.sh suite — fake `claude`/`codex`/`opencode`/`agy` binaries
                              # on PATH, zero network, zero tokens; exit 0 = green
 scripts/test-ralph.sh <case> # run a single case
 scripts/check-shell.sh       # bash -n over all scripts + shellcheck when available
